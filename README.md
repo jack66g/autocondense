@@ -1,128 +1,134 @@
 # autocondense
 
-AI 编程智能体（ZCode / Claude Code / Codex / Cursor）的**会话上下文自动压缩**系统：
-在恰当时机（计划闭环 / 长任务完成 / 上下文水位高 / 连续 idle / 轮次多）把冗长会话压缩成一份结构化
-「会话快照」（支持**增量 delta 摘要**，攒满自动全量合并），原生压缩（/compact、/clear）后按优先级
-恢复包自动恢复（未完成/恢复指针优先，附建议重读文件清单）——过程细节归档，结论与恢复指针保留。
-开箱全自动（enabled=true 零提示零确认，enabled=false 完全不干预）；候选命中先过一张大模型
-轻量判定表再压缩。可选联动 SME 记忆插件，把快照按**分段画像**沉淀为可逐条强化的长期记忆
-（批量入库、入库前查重强化相似段）。
+**Zero-prompt context compression for AI coding agents — LLM-judged timing, incremental session snapshots, and per-fact long-term memory. MCP-native, works with Claude Code, Codex, Cursor & ZCode.**
 
-- 插件源目录：`plugins/autocondense/`（`.zcode-plugin/plugin.json` + Python 包 + hooks + skills + 命令）
-- 常驻服务：`python -m autocondense.service`（默认 `http://127.0.0.1:8761`，仅监听本机回环）
-- MCP 服务器：`python plugins/autocondense/autocondense/mcp_server.py`（stdio，自动拉起常驻服务）
-- 钩子：`python plugins/autocondense/autocondense/hooks/ac_hook.py <Event>`（PostToolUse / Stop / SessionStart；PostToolUseFailure 仅 ZCode；PreCompact 仅 Claude Code）
-- 数据目录：`~/.autocondense/`（与代码位置解耦，插件更新不丢数据）
-- REST 契约：[docs/CONTRACT.md](docs/CONTRACT.md)（接入层开发以此为准）
+English | [中文](README.zh-CN.md)
 
-## 架构
+## Why
+
+Every agent ships auto-compact: it fires at a hard token threshold and hopes the summary lands well — usually mid-task. autocondense takes a different route:
+
+- **The agent decides when to compress.** Rule signals (plan closed, long task finished, water level, idle streak) only *propose* a candidate. The agent itself answers a 5-field judgment form — *is the task finished? what's the impact of compressing right now? is anything unsaved?* — and only then is a snapshot written. The best moment to compress is a task boundary; no threshold knows where it is, the agent does.
+- **Snapshots are structured and incremental.** A fixed template (goals / done / pending / decisions / pitfalls / file changes / restore pointers). Delta-only by default with a full merge every 5 snapshots — countering the well-known quality decay of repeated compaction.
+- **Memory, not a blob.** Each snapshot is split into per-fact segments — every decision, pitfall, todo and accomplishment stored separately with its own tags and importance — so retrieval and reinforcement (Ebbinghaus-style) hit individual facts, and everything survives across sessions via an optional local memory backend.
+- **Restoration is priority-packed.** After `/compact` the agent gets pending items and restore pointers first, plus a short list of key files to re-read — not a wall of truncated text.
+- **Fully automatic, or fully off.** `enabled=true` means zero prompts and zero confirmations; `enabled=false` means the plugin is completely inert. There is no "should I compress?" chatter, ever.
+- **Local & private.** A resident service bound to `127.0.0.1` only. No cloud, no API keys, no telemetry.
+
+## How it works
 
 ```
-┌──────────────────────────────── 宿主智能体 ────────────────────────────────┐
-│  ZCode / Claude Code / Codex / Cursor                                      │
-│    │ MCP (stdio)                          │ hooks (stdin JSON → stdout)   │
-│    ▼                                      ▼                               │
-│  autocondense/mcp_server.py      autocondense/hooks/ac_hook.py            │
-│  （薄代理：7 个 condense_* 工具，  （薄代理：转发事件，Stop 可 block，        │
-│    惰性拉起服务，cwd→会话映射）      SessionStart 注入恢复上下文，闩锁防死循环）│
-└──────────┬───────────────────────────────────┬──────────────────────────────┘
-           │ HTTP 127.0.0.1:8761（trust_env=False）
-           ▼                                   │
-┌──────────────────────────────────────────────▼──────────────────────────────┐
-│  autocondense.service（FastAPI 常驻，唯一数据落盘方）                          │
-│    /session/start /report /check /judge /begin /commit /restore /status /config │
-│    /events/hook（PostToolUse-TodoWrite/Edit/Write / Stop / SessionStart / PostToolUseFailure / PreCompact）│
-│  ┌────────────┐ ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐  │
-│  │ signals    │ │ state      │ │ digest   │ │ sme_bridge│ │ config       │  │
-│  │ 候选判定    │ │ 会话/快照/  │ │ 模板/校验 │ │ 分段画像   │ │ env>json 深合 │  │
-│  │ 大模型判定表 │ │ 事件流水    │ │ 恢复载荷  │ │ 失败降级   │ │ 并默认原子写  │  │
-│  └────────────┘ └────────────┘ └──────────┘ └───────────┘ └──────────────┘  │
-└──────────────┬──────────────────────────────────────────┬───────────────────┘
-               ▼                                          ▼
-        ~/.autocondense/（原子写：config.json、      SME 记忆插件（127.0.0.1:8000，
-        sessions-state.json、sessions.jsonl、       记忆入库/检索，不在线只降级）
-        snapshots/{项目hash}/*.md + index.json）
+rules propose a candidate ──▶ agent self-judges (5-field form) ──▶ verdict
+                                     │                                │
+                              DEFERRED (backoff                COMPRESS_NOW
+                              5→10→20 turns)                          │
+                                     │                          write snapshot
+                                  keep working                    (delta mode)
+                                                                    │
+                                              after /compact ◀───────┤
+                                                     │                └▶ per-fact
+                                            priority restore pack  ──▶ memory segments
+                                            + re-read file hints
 ```
 
-设计细节见 [docs/设计.md](docs/设计.md)。
+Judgment matrix: **normal** requires *task finished AND low impact AND safe*; **urgent** (water level ≥85%) only requires *safe AND impact ≠ high* — when the host is about to lossily compact anyway, archiving first is a net win even mid-task.
 
-## 快速开始
+## Architecture
+
+```
+┌────────────────────────────── host agent ───────────────────────────────┐
+│  ZCode / Claude Code / Codex / Cursor                                    │
+│    │ MCP (stdio)                              │ hooks (stdin→stdout)    │
+│    ▼                                          ▼                         │
+│  mcp_server.py (thin proxy, 7 tools,     ac_hook.py (event forwarder,   │
+│  lazy service spawn, cwd→session map)     Stop can block, latch-guarded,│
+│                                            SessionStart injects restore)│
+└──────────┬─────────────────────────────────────┬───────────────────────┘
+           │ HTTP 127.0.0.1:8761  (trust_env=False)
+           ▼                                     │
+┌───────────────────────────────────────────────▼─────────────────────────┐
+│  autocondense.service  (FastAPI, the single writer)                      │
+│    /session/start /report /check /judge /begin /commit /restore          │
+│    /status /config /events/hook                                           │
+│    signals · state · digest · sme_bridge · config                        │
+└──────────────┬─────────────────────────────────────────┬────────────────┘
+               ▼                                         ▼
+   ~/.autocondense/ (atomic writes:         optional memory backend
+   config, snapshots + index, sessions,     (local HTTP API, degrades
+   delta-state, service.pid)                gracefully when offline)
+```
+
+Design notes: [docs/设计.md](docs/设计.md) · Full REST contract: [docs/CONTRACT.md](docs/CONTRACT.md) (Chinese).
+
+## Install
+
+Requirements: Python 3.10+, `pip install -r requirements.txt`.
+
+**ZCode (desktop, recommended)** — via the plugin marketplace (the desktop app does not read `~/.zcode/cli/config.json`):
+
+1. Marketplace → Add → Add Plugin Marketplace → paste the `plugins/` directory of this repo
+2. Personal → **autocondense** → Install
+3. New conversation: MCP auto-connects, all four hooks register, skill + `/condense` command ship with the plugin
+
+**Other hosts (Claude Code / Codex / Cursor, and ZCode CLI)** — installer, dry-run by default:
 
 ```bash
-pip install -r requirements.txt   # 或 pip install -e .
-pytest -q                          # 187 个测试
-
-# ZCode 桌面端（推荐）：走插件市场——桌面端不读 ~/.zcode/cli/config.json 的 mcp/hooks
-#   插件市场 → 添加 → 添加插件市场 → 粘贴：plugins/ 目录 → 个人 → autocondense 会话压缩 → 安装
-#   （插件自带 MCP + hooks + 技能 + /condense 命令，MCP 自动连接、hook runner 自动启用）
-#   已装过要升级：市场页齿轮 → 刷新该市场 → 个人 → autocondense → 更新；
-#   更新后旧版常驻服务会被 MCP 代理按版本握手自动接管替换（service.pid），无需手动处理
-
-# 其他宿主（Claude Code / Codex / Cursor，及 ZCode CLI）：运行安装器（默认 dry-run，--yes 落盘）
-python installer.py                # 预览各宿主的改前→改后 diff
+python installer.py                # preview diffs per host
 python installer.py --hosts claude,codex,cursor --yes
-python installer.py --list         # 查看各宿主配置状态
-python installer.py --uninstall --yes   # 摘除我们写入的条目
-
-# 验证：起服务 / 钩子手动喂事件
-python -m autocondense.service --port 8761 &
-curl http://127.0.0.1:8761/health
-echo '{"session_id":"t1","cwd":"C:/tmp","source":"compact"}' | \
-  python plugins/autocondense/autocondense/hooks/ac_hook.py SessionStart
+python installer.py --uninstall --yes   # removes only our entries
 ```
 
-安装器写入位置（**zcode 条目仅对 ZCode CLI 生效，桌面端请走插件市场**）：
-claude `~/.claude.json`（mcpServers）+ `~/.claude/settings.json`（hooks）、
-codex `~/.codex/config.toml`（[mcp_servers.autocondense]）、cursor `~/.cursor/mcp.json`、
-zcode-cli `~/.zcode/cli/config.json`。
-MCP 工具的完整使用纪律见 [plugins/autocondense/skills/autocondense/SKILL.md](plugins/autocondense/skills/autocondense/SKILL.md)。
+Manual configs for every host: [docs/接入.md](docs/接入.md) (Chinese).
 
-## 配置项
+**Verify:**
 
-`~/.autocondense/config.json`（PUT /config 深合并热更新；env `AUTOCONDENSE_DATA_DIR` 换数据目录，
-`AUTOCONDENSE_PORT` 换默认端口，`AUTOCONDENSE_BASE_URL` 覆盖钩子的服务地址）：
+```bash
+python -m pytest -q                          # 187 tests
+python -m autocondense.service --port 8761 & curl http://127.0.0.1:8761/health
+```
 
-| 键 | 默认 | 说明 |
+## The seven MCP tools
+
+| Tool | When | What |
 | --- | --- | --- |
-| port / host | 8761 / 127.0.0.1 | 常驻服务监听 |
-| enabled | true | true=全自动压缩（零提示零确认）；false=完全不干预（等同禁用插件） |
-| cooldown_minutes | 30 | 压缩后冷却（防重复压） |
-| turns_threshold | 25 | 轮次候选阈值 |
-| water_threshold | 0.7 | 上下文水位候选阈值（est/可用窗口；≥0.85 进入 urgent 档） |
-| usable_context_tokens | 160000 | 可用上下文窗口 |
-| task_min_rounds | 5 | 长任务完成的跨度阈值（轮） |
-| judge_defer_turns / judge_defer_max_turns | 5 / 20 | 大模型判定不通过后的延迟：指数退避 5→10→20 封顶 |
-| restore_max_chars | 8000 | 恢复包优先级打包的字符预算（钩子侧再截 9000） |
-| restore_top_n | 3 | 恢复取最近 N 份快照 |
-| restore_reread_files | 5 | 恢复包建议重读文件清单条数 |
-| delta_mode / delta_merge_every | true / 5 | 增量摘要：已有快照时只写增量，每 5 份强制全量合并 |
-| idle_signal_rounds | 3 | idle 候选阈值：连续 N 轮无文件修改与失败 → 疑似任务停歇 |
-| sme.enabled / base_url / timeout_s / tags / importance / split_segments / max_segments | true / 127.0.0.1:8000 / 2.0 / … / true / 15 | SME 桥接与分段画像（split_segments=false 整篇入库） |
-| sme.dedup / sme.dedup_threshold | true / 0.92 | 入库前查重：命中同项目同类型高分旧段时强化旧段而非重复新增 |
+| `condense_restore` | session start / after compaction | priority restore pack + memory hits + next actions |
+| `condense_report` / `condense_check` | after each task batch / turn | report plan items, get candidate verdict |
+| `condense_judge` | when `should=JUDGE` | submit the 5-field judgment form (agent self-assessment) |
+| `condense_begin` / `condense_commit` | after COMPRESS_NOW | get template (delta by default) → submit snapshot |
+| `condense_status` | debugging | service / sessions / config overview |
 
-## 判定链路（候选制 + 大模型判定表）
+## Judgment pipeline (rules, in order)
 
-1. 有进行中任务 → **NO**（任务连续性优先）
-2. 冷却期内 → **NO**
-3. 计划全部完成 → **候选** / plan_done
-4. 跨度 ≥task_min_rounds 的任务已完成 → **候选** / task_done
-5. 水位 ≥water_threshold → **候选** / water_level（水位优先用 hook 上报的真实 context_tokens）
-6. 连续 idle_signal_rounds 轮无文件修改与失败 → **候选** / idle（疑似任务停歇）
-7. 距上次压缩 ≥turns_threshold 轮 → **候选** / turns
-8. 否则 → **NO**
+1. in-progress tasks > 0 → **NO** (task continuity first)
+2. cooldown → **NO**
+3. all plan items completed → candidate / `plan_done`
+4. task spanning ≥5 turns completed → candidate / `task_done`
+5. water level ≥70% (host-reported tokens preferred) → candidate / `water_level`
+6. ≥3 turns without file edits or failures → candidate / `idle`
+7. ≥25 turns since last compress → candidate / `turns`
 
-命中候选（should=JUDGE）→ 智能体立即自评判定表提交 `condense_judge`（不询问用户；可选附
-confidence 置信度，响应带回 rounds_to_full 紧迫度估算）。
-判定矩阵：**normal 档需 任务完成 且 影响 low 且 安全；urgent 档（水位 ≥85%）只需 安全 且
-影响≠high**（任务未收尾也可压）。通过 → 直接 begin→commit 全自动压缩（begin 默认增量模式，
-只写自上一份快照以来的变化）；不通过 → 指数退避（5→10→20 轮封顶）后重新评估。
+## Configuration
 
-## 常见问题
+`~/.autocondense/config.json` (hot-reload via `PUT /config`); key items:
 
-- **8761 被占用？** 换端口三处一致即可：`python -m autocondense.service --port 8762`，
-  MCP 侧给 mcp_server 传 env `AUTOCONDENSE_PORT=8762`，钩子侧传 env `AUTOCONDENSE_BASE_URL=http://127.0.0.1:8762`。
-- **SME 不在线会怎样？** 只降级：快照照常落本地磁盘，restore 不带 SME 结果，判定不受任何影响。
-- **如何停用自动压缩？** `PUT /config` 设 `enabled=false`（立即生效，等同在宿主里禁用插件）；重新设 true 恢复。用户主动 `/condense` 不受影响。
-- **MCP 宿主杀进程树会带走常驻服务吗？** Windows 下 mcp 客户端退出时可能连分离进程一起杀；
-  无妨——下次任一工具调用会通过 `_ensure_service` 秒级重新拉起。
-- **钩子会不会拖垮宿主？** 不会：3s 超时、任何异常静默 exit 0；Stop 的 block 有 15 分钟闩锁防死循环。
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | fully automatic vs completely inert |
+| `cooldown_minutes` / `turns_threshold` / `water_threshold` | 30 / 25 / 0.7 | candidate thresholds |
+| `usable_context_tokens` | 160000 | context window for water level |
+| `judge_defer_turns` / `judge_defer_max_turns` | 5 / 20 | deferred-judgment backoff cap |
+| `restore_max_chars` / `restore_reread_files` | 8000 / 5 | restore pack budget & re-read list |
+| `delta_mode` / `delta_merge_every` | true / 5 | incremental snapshots & full-merge cycle |
+| `idle_signal_rounds` | 3 | idle candidate threshold |
+| `sme.*` | — | memory backend: url, segmentation, dedup threshold, batch size |
+
+## FAQ
+
+- **SME/memory backend offline?** Everything degrades: snapshots still land on local disk, restore skips memory hits, judgment is unaffected. Never blocks.
+- **Port 8761 occupied?** Start with `--port 8762`, set `AUTOCONDENSE_PORT` (MCP) and `AUTOCONDENSE_BASE_URL` (hooks).
+- **Disable temporarily?** `PUT /config {"enabled": false}` — instantly inert, or just disable the plugin in the host.
+- **Plugin upgrade leaves a stale service?** The MCP proxy health-checks the version and takes over the old process automatically via `service.pid` — never kills blindly.
+
+## License
+
+Apache-2.0

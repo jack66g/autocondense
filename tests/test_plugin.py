@@ -135,10 +135,14 @@ def test_docs_consistency():
     assert "idle_signal_rounds" in contract and "dedup_threshold" in contract
     assert "TodoWrite|Edit|Write" in contract
     assert "先询问" not in contract and "请询问用户" not in contract
+    # 英文主 README（开源门面）+ 中文版 README.zh-CN.md 双语并存
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "condense_judge" in readme and "enabled" in readme
-    assert "7 个 condense_*" in readme and "mode=manual" not in readme
-    assert "187" in readme and "增量" in readme and "idle" in readme
+    assert "mode=manual" not in readme
+    assert "187" in readme and "idle" in readme and "incremental" in readme.lower()
+    assert "README.zh-CN.md" in readme and "Apache-2.0" in readme
+    zh = (REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
+    assert "7 个 condense_*" in zh and "增量" in zh and "README.md" in zh
 
 
 def test_importable_from_foreign_cwd(tmp_path):
