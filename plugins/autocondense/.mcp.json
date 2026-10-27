@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "autocondense": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/autocondense/mcp_server.py"
+      ]
+    }
+  }
+}

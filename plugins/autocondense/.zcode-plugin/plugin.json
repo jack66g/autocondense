@@ -1,0 +1,10 @@
+{
+  "name": "autocondense",
+  "version": "0.3.0",
+  "description": "会话上下文自动压缩：候选命中经大模型轻量判定后全自动生成结构化快照（增量 delta 摘要），分段画像双写本地与 SME 记忆库（批量入库、查重强化），原生压缩（/compact、/clear）后自动恢复上下文，一个会话从头干到尾",
+  "author": { "name": "autocondense" },
+  "skills": "./skills",
+  "commands": "./commands",
+  "hooks": "hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocondense"
+version = "0.1.0"
+description = "AI 编程智能体会话上下文自动压缩常驻服务（REST 核心层）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "httpx>=0.24",
+    "mcp>=2.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=2.0"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+autocondense-service = "autocondense.service:main"
+
+[tool.setuptools]
+package-dir = {"" = "plugins/autocondense"}
+packages = ["autocondense", "autocondense.hooks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["plugins/autocondense"]
